@@ -17,20 +17,20 @@ from pm4py.visualization.petri_net import visualizer as pn_visualizer
 from pm4py.objects.log.util import dataframe_utils
 
 
-def breakfast_to_event_log(breakfast_path: str, filter_sil: bool = True) -> pd.DataFrame:
+def dataset_to_event_log(dataset_path: str, filter_labels: list[str] | None = None) -> pd.DataFrame:
     """
-    Convert Breakfast dataset (ASFormer groundTruth format) to PM4Py event log.
+    Convert ASFormer-style dataset groundTruth to PM4Py event log.
 
     Each groundTruth .txt file = one case (video). Each line = frame-level action label.
     Consecutive identical labels are collapsed into a single event.
 
     Args:
-        breakfast_path: Path to Breakfast data folder (contains groundTruth/, mapping.txt)
-        filter_sil: If True, exclude SIL (silence) from traces
+        dataset_path: Path to dataset folder (contains groundTruth/, mapping.txt)
+        filter_labels: Labels to exclude from traces (e.g. ["SIL", "background"])
     Returns:
         DataFrame with case:concept:name, concept:name, time:timestamp
     """
-    gt_dir = os.path.join(breakfast_path, "groundTruth")
+    gt_dir = os.path.join(dataset_path, "groundTruth")
     if not os.path.isdir(gt_dir):
         raise FileNotFoundError(f"groundTruth folder not found at {gt_dir}")
 
@@ -47,7 +47,7 @@ def breakfast_to_event_log(breakfast_path: str, filter_sil: bool = True) -> pd.D
         prev = None
         event_idx = 0
         for frame_idx, label in enumerate(labels):
-            if filter_sil and label == "SIL":
+            if filter_labels and label in filter_labels:
                 continue
             if label == prev:
                 continue
@@ -63,6 +63,32 @@ def breakfast_to_event_log(breakfast_path: str, filter_sil: bool = True) -> pd.D
     if df.empty:
         raise ValueError("No events found. Check groundTruth files.")
     return df
+
+
+def breakfast_to_event_log(breakfast_path: str, filter_sil: bool = True) -> pd.DataFrame:
+    """Backward-compatible wrapper."""
+    filters = ["SIL"] if filter_sil else None
+    return dataset_to_event_log(breakfast_path, filter_labels=filters)
+
+
+def _download_url_to_file(url: str, dest_path: str) -> None:
+    """Download URL to a file; retry without cert verification if the OS SSL bundle fails (common on macOS)."""
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    try:
+        urllib.request.urlretrieve(url, dest_path)
+        return
+    except (urllib.error.URLError, ssl.SSLError) as e:
+        err = str(e).lower()
+        if "certificate" not in err and "ssl" not in err:
+            raise
+    ctx = ssl._create_unverified_context()
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, context=ctx) as response:
+        with open(dest_path, "wb") as out:
+            out.write(response.read())
 
 
 def create_petri_net_from_event_log(
@@ -190,23 +216,61 @@ def create_petri_net_from_event_log_heuristics(
 
 
 def main():
-    import urllib.request
+    import argparse
 
-    BREAKFAST_PATH = "/Users/yaelreina/ASFormer-main/data/breakfast"
-    OUTPUT_PNG = "petri_net_output.png"
+    parser = argparse.ArgumentParser(description="Discover a Petri net from an ASFormer dataset or XES/CSV.")
+    parser.add_argument(
+        "--dataset-root",
+        default="",
+        help="Path to dataset folder (groundTruth/, mapping.txt). Default: Breakfast path if it exists.",
+    )
+    parser.add_argument(
+        "--dataset",
+        default="breakfast",
+        choices=["breakfast", "50salads"],
+        help="Dataset name: sets default silence filter (breakfast→SIL, 50salads→background).",
+    )
+    parser.add_argument("--output-png", default="petri_net_output.png", help="Path for Petri net PNG visualization.")
+    parser.add_argument(
+        "--output-pnml",
+        default="",
+        help="Optional path to save the chosen net as PNML (for ASFormer --petri_mode load).",
+    )
+    cli = parser.parse_args()
 
-    if os.path.isdir(BREAKFAST_PATH):
-        print(f"Converting Breakfast dataset from: {BREAKFAST_PATH}")
-        df = breakfast_to_event_log(BREAKFAST_PATH, filter_sil=True)
+    default_breakfast = "/Users/yaelreina/ASFormer-main/data/breakfast"
+    if cli.dataset_root:
+        dataset_path = os.path.abspath(os.path.expanduser(cli.dataset_root))
+    elif cli.dataset == "50salads":
+        dataset_path = os.path.join(os.path.expanduser("~"), "ASFormer-main", "data", "50salads")
+    else:
+        dataset_path = default_breakfast
+
+    if cli.dataset == "50salads":
+        filter_labels = ["background"]
+    else:
+        filter_labels = ["SIL"]
+
+    OUTPUT_PNG = cli.output_png
+
+    if os.path.isdir(dataset_path):
+        print(f"Converting dataset from: {dataset_path}")
+        df = dataset_to_event_log(dataset_path, filter_labels=filter_labels)
         print(f"  Loaded {len(df)} events from {df['case:concept:name'].nunique()} traces")
         log_input = df
+    elif cli.dataset_root:
+        raise SystemExit(
+            f"Dataset path does not exist: {dataset_path}\n"
+            f"Replace the placeholder with your real folder (must contain groundTruth/ and mapping.txt), e.g.\n"
+            f"  --dataset-root \"{os.path.expanduser('~/ASFormer-main/data/50salads')}\""
+        )
     else:
-        # Fallback: download running-example.xes from PM4Py
+        # Fallback only when no --dataset-root was given and default paths are missing: demo XES from PM4Py
         fallback = "running-example.xes"
         if not os.path.exists(fallback):
             url = "https://raw.githubusercontent.com/pm4py/pm4py-core/release/tests/input_data/running-example.xes"
-            print(f"Breakfast not found. Downloading sample log...")
-            urllib.request.urlretrieve(url, fallback)
+            print(f"No default dataset at {dataset_path}. Downloading sample log...")
+            _download_url_to_file(url, fallback)
         log_input = fallback
         print(f"Using: {log_input}")
 
@@ -339,14 +403,21 @@ def main():
     print(f"    Fitness:  {fitness_subset:.4f}  Precision: {precision_subset:.4f}  (tight model)")
     print(f"\n  Visualization saved to: {OUTPUT_PNG}")
 
-    # Action-to-transition mapper for Transformer integration (Breakfast only)
-    if isinstance(log_input, pd.DataFrame) and os.path.isdir(BREAKFAST_PATH):
+    if cli.output_pnml:
+        from pm4py.objects.petri_net.exporter import exporter as pnml_exporter
+
+        pnml_exporter.apply(net, im, cli.output_pnml, final_marking=fm)
+        print(f"\n  PNML saved to: {cli.output_pnml}")
+
+    # Action-to-transition mapper for ASFormer integration
+    if isinstance(log_input, pd.DataFrame) and os.path.isdir(dataset_path):
         try:
             from petri_translation_layer import get_mapper_summary
-            mapping_path = os.path.join(BREAKFAST_PATH, "mapping.txt")
+
+            mapping_path = os.path.join(dataset_path, "mapping.txt")
             summary = get_mapper_summary(net, mapping_path)
             print(f"\n  Action–Transition mapper (for ASFormer):")
-            print(f"    Breakfast actions: {summary['num_actions']}, net transitions: {summary['num_transitions']}, mapped: {summary['num_mapped']}")
+            print(f"    Dataset actions: {summary['num_actions']}, net transitions: {summary['num_transitions']}, mapped: {summary['num_mapped']}")
             if summary["unmapped_actions"]:
                 print(f"    Unmapped (no transition in net): {summary['unmapped_actions'][:10]}{'...' if len(summary['unmapped_actions']) > 10 else ''}")
         except Exception as e:
